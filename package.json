@@ -1,0 +1,37 @@
+{
+  "name": "dsh-license-checker",
+  "version": "1.0.0",
+  "description": "DSH 插件：许可证合规检查",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    },
+    "./client": {
+      "import": "./dist/client/index.js",
+      "types": "./dist/client/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "cordis": "^3.0.0",
+    "dsh": ">=0.1.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "cordis": "^3.0.0",
+    "tsdown": "^0.5.0",
+    "typescript": "^5.4.0",
+    "zod": "^3.22.0"
+  }
+}
