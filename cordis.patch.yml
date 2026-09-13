@@ -1,6 +1,17 @@
-name: dsh-license-checker
-version: 1.0.0
-description: DSH 插件：许可证合规检查
-author: ''
-license: MIT
-homepage: https://github.com/qingshanjiluo/dsh-license-checker
+# dsh-license-checker bundle layer: inserts the host tool plugin into a profile's
+# layer stack. Install with:
+#   npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-license-checker
+- insert:
+    - id: license-checker
+      name: '@qingshanjiluo/dsh-license-checker'
+      config:
+        allow:
+          - MIT
+          - Apache-2.0
+          - BSD-2-Clause
+          - BSD-3-Clause
+          - ISC
+        deny:
+          - AGPL-3.0-only
+          - AGPL-3.0
+          - SSPL-1.0

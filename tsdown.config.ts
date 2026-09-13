@@ -1,19 +1,13 @@
-import { defineConfig } from 'tsdown';
+import { defineConfig } from 'tsdown'
 
-export default defineConfig([
-  {
-    entry: ['src/index.ts'],
-    format: ['esm', 'cjs'],
-    dts: true,
-    outDir: 'dist',
-    clean: true,
-    external: ['cordis', 'zod', 'dsh'],
-  },
-  {
-    entry: ['client/index.tsx'],
-    format: ['esm'],
-    dts: true,
-    outDir: 'dist/client',
-    external: ['cordis', 'zod', 'dsh', 'react'],
-  },
-]);
+export default defineConfig({
+  entry: { index: 'src/index.ts' },
+  outDir: 'lib',
+  format: ['esm'],
+  platform: 'node',
+  target: 'es2022',
+  external: [/^@deepseek-ai\//, /^node:/],
+  dts: true,
+  clean: true,
+  tsconfig: 'tsconfig.json',
+})

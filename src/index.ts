@@ -1,210 +1,331 @@
 /**
- * dsh-license-checker — 许可证合规检查
+ * Pure SPDX license-policy tools for DeepSeek Harness.
  *
- * 功能：
- * 1. 扫描项目依赖许可证
- * 2. 检测许可证兼容性
- * 3. 识别限制性许可证（GPL/AGPL/SSPL）
- * 4. 生成许可证报告
- * 5. 许可证冲突检测
+ * Three model-facing tools, all deterministic and network-free:
+ *  - `license_check`   check a dependency list against an allow/deny policy.
+ *  - `license_classify` map a single SPDX id to a license family.
+ *  - `license_compat`   flag copyleft-vs-permissive/proprietary conflicts.
  *
- * 工具：license_scan, license_check, license_report, license_compat
- * 命令：/license
- * 配置：enabled, allowed, restricted, outputFormat
+ * There is no filesystem, subprocess, or network access: the model supplies the
+ * dependency data and the plugin reasons over an embedded SPDX table.
+ * @module @qingshanjiluo/dsh-license-checker
  */
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
-import { resolve, join } from 'node:path';
-import { z } from 'zod';
 
-export const name = 'dsh-license-checker';
-export const inject = ['settings', 'tools', 'commands'];
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-const configSchema = z.object({
-  enabled: z.boolean().default(true),
-  allowed: z.array(z.string()).default(['MIT', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC']),
-  restricted: z.array(z.string()).default(['GPL-2.0', 'GPL-3.0', 'AGPL-3.0', 'SSPL-1.0']),
-  outputFormat: z.enum(['text', 'json', 'markdown']).default('text'),
-});
+export const name = 'dsh-license-checker'
+export const inject = ['tools']
 
-type Config = z.infer<typeof configSchema>;
-
-interface LicenseInfo {
-  name: string;
-  version: string;
-  license: string;
-  repository?: string;
-  publisher?: string;
+/** Deployment policy defaults consumed by {@link apply}. */
+export interface Config {
+  /** SPDX ids permitted when a caller passes an empty allow list. */
+  allow: string[]
+  /** SPDX ids always rejected when a caller passes an empty deny list. */
+  deny: string[]
 }
 
-const LICENSE_PATTERNS: Record<string, string> = {
-  'MIT': 'MIT',
-  'Apache-2.0': 'Apache-2.0',
-  'BSD-2-Clause': 'BSD-2-Clause',
-  'BSD-3-Clause': 'BSD-3-Clause',
-  'ISC': 'ISC',
-  'GPL-2.0': 'GPL-2.0',
-  'GPL-3.0': 'GPL-3.0',
-  'AGPL-3.0': 'AGPL-3.0',
-  'LGPL-2.1': 'LGPL-2.1',
-  'LGPL-3.0': 'LGPL-3.0',
-  'MPL-2.0': 'MPL-2.0',
-  'Unlicense': 'Unlicense',
-  'CC0-1.0': 'CC0-1.0',
-};
+/** Schemastery configuration for the license checker. */
+export const Config: z<Config> = z.object({
+  allow: z.array(z.string()).default(['MIT', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC']),
+  deny: z.array(z.string()).default(['AGPL-3.0-only', 'AGPL-3.0', 'SSPL-1.0']),
+})
 
-function scanPackageJsonDeps(pkgPath: string): LicenseInfo[] {
-  if (!existsSync(pkgPath)) return [];
-  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-  return Object.entries(deps).map(([name, version]) => ({
-    name,
-    version: String(version),
-    license: 'unknown',
-  }));
+/** Recognised license families produced by the classifier. */
+export type LicenseFamily = 'permissive' | 'copyleft' | 'weak-copyleft' | 'proprietary' | 'unknown'
+
+/** Embedded SPDX-id -> family table (ids stored upper-cased for lookup). */
+const SPDX_FAMILY: Record<string, LicenseFamily> = {
+  'MIT': 'permissive',
+  'MIT-0': 'permissive',
+  'APACHE-2.0': 'permissive',
+  'BSD-2-CLAUSE': 'permissive',
+  'BSD-3-CLAUSE': 'permissive',
+  '0BSD': 'permissive',
+  'ISC': 'permissive',
+  'UNLICENSE': 'permissive',
+  'CC0-1.0': 'permissive',
+  'ZLIB': 'permissive',
+  'POSTGRESQL': 'permissive',
+  'PYTHON-2.0': 'permissive',
+  'BSL-1.0': 'permissive',
+  'ARTISTIC-2.0': 'permissive',
+  'WTFPL': 'permissive',
+  'GPL-2.0': 'copyleft',
+  'GPL-2.0-ONLY': 'copyleft',
+  'GPL-2.0-OR-LATER': 'copyleft',
+  'GPL-3.0': 'copyleft',
+  'GPL-3.0-ONLY': 'copyleft',
+  'GPL-3.0-OR-LATER': 'copyleft',
+  'AGPL-3.0': 'copyleft',
+  'AGPL-3.0-ONLY': 'copyleft',
+  'AGPL-3.0-OR-LATER': 'copyleft',
+  'AGPL-1.0': 'copyleft',
+  'GFDL-1.3-ONLY': 'copyleft',
+  'GFDL-1.3-OR-LATER': 'copyleft',
+  'SSPL-1.0': 'copyleft',
+  'QPL-1.0-INLAMP-2020': 'copyleft',
+  'LGPL-2.0': 'weak-copyleft',
+  'LGPL-2.1': 'weak-copyleft',
+  'LGPL-2.1-ONLY': 'weak-copyleft',
+  'LGPL-2.1-OR-LATER': 'weak-copyleft',
+  'LGPL-3.0': 'weak-copyleft',
+  'LGPL-3.0-ONLY': 'weak-copyleft',
+  'LGPL-3.0-OR-LATER': 'weak-copyleft',
+  'MPL-2.0': 'weak-copyleft',
+  'MPL-1.1': 'weak-copyleft',
+  'CPL-1.0': 'weak-copyleft',
+  'EPL-1.0': 'weak-copyleft',
+  'EPL-2.0': 'weak-copyleft',
+  'CECILL-B': 'weak-copyleft',
+  'BUSL-1.1': 'proprietary',
+  'LICENSEREF-PROPRIETARY': 'proprietary',
+  'PROPRIETARY': 'proprietary',
 }
 
-function detectLicenseInNodeModules(deps: LicenseInfo[]): LicenseInfo[] {
+const GPL_IDS = new Set(['GPL-2.0', 'GPL-2.0-ONLY', 'GPL-2.0-OR-LATER', 'GPL-3.0', 'GPL-3.0-ONLY', 'GPL-3.0-OR-LATER'])
+const AGPL_IDS = new Set(['AGPL-3.0', 'AGPL-3.0-ONLY', 'AGPL-3.0-OR-LATER', 'AGPL-1.0'])
+
+/**
+ * Normalise a license id for deterministic table lookups: trim, collapse
+ * internal whitespace, upper-case.
+ * @param licenseId - raw SPDX identifier.
+ */
+function normalize(licenseId: string): string {
+  return licenseId.trim().replace(/\s+/g, ' ').toUpperCase()
+}
+
+/**
+ * Classify a single SPDX id into a family plus a commercial-use verdict.
+ * Commercial use is allowed for every recognised open family; proprietary and
+ * unknown ids are conservatively flagged as not allowed.
+ * @param licenseId - raw SPDX identifier.
+ */
+function classifyOne(licenseId: string): { id: string; family: LicenseFamily; allowedCommercial: boolean } {
+  const id = normalize(licenseId)
+  const family = SPDX_FAMILY[id] ?? 'unknown'
+  const allowedCommercial = family !== 'proprietary' && family !== 'unknown'
+  return { id: licenseId.trim(), family, allowedCommercial }
+}
+
+/**
+ * Check a dependency list against allow/deny SPDX ids.
+ * @param deps - dependency name/license pairs.
+ * @param allow - permissive allow-list of SPDX ids (empty means "no allow gate").
+ * @param deny - hard reject-list of SPDX ids.
+ * @returns ok flag and one violation per offending dependency.
+ */
+function checkPolicy(
+  deps: readonly { name: string; license: string }[],
+  allow: readonly string[],
+  deny: readonly string[],
+): { ok: boolean; violations: { name: string; license: string; reason: string }[] } {
+  const allowSet = new Set(allow.map(normalize))
+  const denySet = new Set(deny.map(normalize))
+  const violations: { name: string; license: string; reason: string }[] = []
+
   for (const dep of deps) {
-    const pkgPath = join('node_modules', dep.name, 'package.json');
-    if (existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-        dep.license = typeof pkg.license === 'object' ? pkg.license.type : (pkg.license || 'unknown');
-        dep.repository = pkg.repository?.url || '';
-        dep.publisher = pkg.author || '';
-      } catch {}
+    const id = normalize(dep.license)
+    if (id.length === 0) {
+      violations.push({ name: dep.name, license: dep.license, reason: 'missing license id' })
+      continue
+    }
+    if (denySet.has(id)) {
+      violations.push({ name: dep.name, license: dep.license, reason: 'license is on the deny list' })
+      continue
+    }
+    if (allowSet.size > 0 && !allowSet.has(id)) {
+      violations.push({ name: dep.name, license: dep.license, reason: 'license is not on the allow list' })
+      continue
+    }
+    if (SPDX_FAMILY[id] === undefined) {
+      violations.push({ name: dep.name, license: dep.license, reason: 'license is not a recognized SPDX id' })
     }
   }
-  return deps;
+  return { ok: violations.length === 0, violations }
 }
 
-function classifyLicense(license: string, config: Config): 'allowed' | 'restricted' | 'unknown' {
-  if (config.allowed.some(a => license.includes(a))) return 'allowed';
-  if (config.restricted.some(r => license.includes(r))) return 'restricted';
-  return 'unknown';
-}
+/**
+ * Detect copyleft-vs-permissive/proprietary incompatibilities.
+ * Heuristics (deterministic, documented in README):
+ *  - an unknown SPDX id is always flagged for manual review;
+ *  - a proprietary id combined with any copyleft id is a conflict;
+ *  - GPL-family and AGPL-family coexisting is a conflict.
+ * @param componentLicenses - SPDX ids of the components being combined.
+ */
+function checkCompat(componentLicenses: readonly string[]): { ok: boolean; conflicts: string[] } {
+  const ids = componentLicenses.map(normalize).filter(id => id.length > 0)
+  const families = new Map<string, LicenseFamily>()
+  for (const id of ids) families.set(id, SPDX_FAMILY[id] ?? 'unknown')
 
-function checkCompatibility(licenses: string[], config: Config): { compatible: boolean; conflicts: string[] } {
-  const conflicts: string[] = [];
-  const hasCopyleft = licenses.some(l => l.includes('GPL') || l.includes('AGPL'));
-  const hasPermissive = licenses.some(l => config.allowed.some(a => l.includes(a)));
+  const conflicts: string[] = []
+  const has = (fam: LicenseFamily) => [...families.values()].includes(fam)
+  const hasCopyleft = has('copyleft') || has('weak-copyleft')
 
-  if (hasCopyleft && hasPermissive) {
-    conflicts.push('Copyleft 与 Permissive 许可证混合使用');
+  for (const [id, fam] of families) {
+    if (fam === 'unknown') conflicts.push(`${id}: unrecognized SPDX id, needs manual review`)
   }
-  return { compatible: conflicts.length === 0, conflicts };
+  if (has('proprietary') && hasCopyleft) {
+    conflicts.push('proprietary component combined with a copyleft license')
+  }
+  const anyGpl = ids.some(id => GPL_IDS.has(id))
+  const anyAglp = ids.some(id => AGPL_IDS.has(id))
+  if (anyGpl && anyAglp) {
+    conflicts.push('GPL-family and AGPL-family licenses are not compatible')
+  }
+  return { ok: conflicts.length === 0, conflicts }
 }
 
-export function apply(ctx: any, config: Config) {
-  if (!config.enabled) return;
-
-  ctx.tools.register({
-    name: 'license_scan',
-    description: '扫描项目依赖的许可证',
-    parameters: z.object({
-      path: z.string().default('.'),
-      includeDev: z.boolean().default(true),
-    }),
-    async execute({ path: projectPath, includeDev }: any) {
-      const pkgPath = join(resolve(projectPath), 'package.json');
-      let deps = scanPackageJsonDeps(pkgPath);
-      if (!includeDev) {
-        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-        const devDeps = Object.keys(pkg.devDependencies || {});
-        deps = deps.filter(d => !devDeps.includes(d.name));
-      }
-      deps = detectLicenseInNodeModules(deps);
-      return { total: deps.length, deps };
-    },
-  });
-
-  ctx.tools.register({
+/**
+ * Register the license tools on `ctx.tools`.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param config - deployment's allow/deny policy defaults.
+ */
+export function apply(ctx: Context, config: Config): void {
+  ctx.tools.register(defineTool({
     name: 'license_check',
-    description: '检查许可证合规性',
-    parameters: z.object({
-      path: z.string().default('.'),
-    }),
-    async execute({ path: projectPath }: any) {
-      const pkgPath = join(resolve(projectPath), 'package.json');
-      const deps = detectLicenseInNodeModules(scanPackageJsonDeps(pkgPath));
-      const results = deps.map(d => ({
-        ...d,
-        status: classifyLicense(d.license, config),
-      }));
-
-      const restricted = results.filter(r => r.status === 'restricted');
-      const unknown = results.filter(r => r.status === 'unknown');
-      const allowed = results.filter(r => r.status === 'allowed');
-
-      return {
-        total: deps.length,
-        allowed: allowed.length,
-        restricted: restricted.length,
-        unknown: unknown.length,
-        issues: [...restricted.map(r => `⚠️ ${r.name}: ${r.license}`), ...unknown.map(r => `❓ ${r.name}: ${r.license}`)],
-      };
+    description:
+      'Check a dependency list against a license policy. Pass deps as ' +
+      '[{name, license}] (license = SPDX id) plus allow/deny arrays of SPDX ids; ' +
+      'empty allow/deny fall back to the configured policy. Returns ok and one ' +
+      'violation entry per offending dependency.',
+    parameters: {
+      deps: {
+        type: 'array',
+        required: true,
+        description: 'Dependencies to check.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            name: { type: 'string', required: true, description: 'Package name.' },
+            license: { type: 'string', required: true, description: 'SPDX license id, e.g. MIT.' },
+          },
+        },
+      },
+      allow: {
+        type: 'array',
+        required: true,
+        description: 'Allowed SPDX ids. Empty means use the configured allow list.',
+        items: { type: 'string' },
+      },
+      deny: {
+        type: 'array',
+        required: true,
+        description: 'Denied SPDX ids. Empty means use the configured deny list.',
+        items: { type: 'string' },
+      },
     },
-  });
-
-  ctx.tools.register({
-    name: 'license_report',
-    description: '生成许可证报告',
-    parameters: z.object({
-      format: z.enum(['text', 'json', 'markdown']).optional(),
-    }),
-    async execute({ format }: any) {
-      const pkgPath = 'package.json';
-      const deps = detectLicenseInNodeModules(scanPackageJsonDeps(pkgPath));
-      const fmt = format || config.outputFormat;
-
-      const summary: Record<string, number> = {};
-      for (const dep of deps) {
-        summary[dep.license] = (summary[dep.license] || 0) + 1;
-      }
-
-      if (fmt === 'json') return { summary, deps };
-      if (fmt === 'markdown') {
-        const lines = ['# 许可证报告\n', `总计: ${deps.length} 个依赖\n`, '| 许可证 | 数量 |', '|--------|------|'];
-        for (const [license, count] of Object.entries(summary).sort((a, b) => b[1] - a[1])) {
-          lines.push(`| ${license} | ${count} |`);
-        }
-        return { report: lines.join('\n') };
-      }
-      return { summary, total: deps.length };
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'True when no violations were found.' },
+          violations: {
+            type: 'array',
+            required: true,
+            description: 'One entry per dependency that failed the policy.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: { type: 'string', required: true, description: 'Package name.' },
+                license: { type: 'string', required: true, description: 'License id supplied.' },
+                reason: { type: 'string', required: true, description: 'Why it failed.' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.ok
+          ? 'License policy satisfied: no violations.'
+          : `${value.violations.length} violation(s):\n- ${value.violations.map(v => `${v.name} (${v.license}): ${v.reason}`).join('\n- ')}`,
+      }],
     },
-  });
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const allow = args.allow.length > 0 ? args.allow : config.allow
+      const deny = args.deny.length > 0 ? args.deny : config.deny
+      return Promise.resolve(checkPolicy(args.deps, allow, deny))
+    },
+  }))
 
-  ctx.tools.register({
+  ctx.tools.register(defineTool({
+    name: 'license_classify',
+    description:
+      'Classify one SPDX license id into a family: permissive, copyleft, ' +
+      'weak-copyleft, proprietary, or unknown; plus a commercial-use verdict. ' +
+      'Pure table lookup over an embedded SPDX map — no network.',
+    parameters: {
+      licenseId: { type: 'string', required: true, description: 'SPDX license id, e.g. Apache-2.0.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', required: true, description: 'The trimmed license id supplied.' },
+          family: {
+            type: 'string',
+            required: true,
+            description: 'License family: permissive | copyleft | weak-copyleft | proprietary | unknown.',
+          },
+          allowedCommercial: { type: 'boolean', required: true, description: 'Whether commercial use is presumed allowed.' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `${value.id}: ${value.family} (commercial use ${value.allowedCommercial ? 'allowed' : 'needs review'})`,
+      }],
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      return Promise.resolve(classifyOne(args.licenseId))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'license_compat',
-    description: '检测许可证兼容性',
-    parameters: z.object({
-      licenses: z.array(z.string()).optional().describe('指定许可证列表'),
-    }),
-    async execute({ licenses }: any) {
-      let licenseList = licenses;
-      if (!licenseList) {
-        const pkgPath = 'package.json';
-        const deps = detectLicenseInNodeModules(scanPackageJsonDeps(pkgPath));
-        licenseList = [...new Set(deps.map(d => d.license))];
-      }
-      const result = checkCompatibility(licenseList, config);
-      return { licenses: licenseList, ...result };
+    description:
+      'Check a set of component SPDX ids for licensing incompatibilities using ' +
+      'simple copyleft-vs-permissive heuristics (unknown id, proprietary+copyleft ' +
+      'mix, and GPL+AGPL mix). Returns ok and a list of conflict strings.',
+    parameters: {
+      componentLicenses: {
+        type: 'array',
+        required: true,
+        description: 'SPDX ids of the components being combined.',
+        items: { type: 'string' },
+      },
     },
-  });
-
-  ctx.commands.register({
-    name: 'license',
-    description: '许可证合规检查',
-    async execute(args: string) {
-      const action = args.trim() || 'check';
-      const result = await ctx.tools.execute(`license_${action}`, {});
-      return { content: JSON.stringify(result, null, 2) };
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'True when no conflicts were detected.' },
+          conflicts: {
+            type: 'array',
+            required: true,
+            description: 'Human-readable conflict advisories; empty when ok.',
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.ok
+          ? 'No license compatibility conflicts.'
+          : `${value.conflicts.length} conflict(s):\n- ${value.conflicts.join('\n- ')}`,
+      }],
     },
-  });
-
-  ctx.settings.register({
-    title: 'license-checker',
-    description: '许可证合规检查',
-    config: configSchema,
-  });
+    isConcurrencySafe: () => true,
+    execute(args) {
+      return Promise.resolve(checkCompat(args.componentLicenses))
+    },
+  }))
 }
